@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Logística Pro: Polígonos y Control de Carga</title>
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; font-family: 'Segoe UI', sans-serif; background: #f0f2f5; }
+        #map { height: 100vh; width: 100%; }
+        #ui-panel {
+            position: absolute; top: 20px; left: 20px; z-index: 10;
+            background: white; padding: 20px; border-radius: 12px;
+            box-shadow: 0 8px 30px rgba(0,0,0,0.3); width: 360px;
+            max-height: 90vh; overflow-y: auto;
+        }
+        .control-group { margin-bottom: 12px; background: #f8f9fa; padding: 12px; border-radius: 8px; border: 1px solid #ddd; }
+        label { display: block; font-size: 11px; font-weight: bold; margin-bottom: 5px; color: #444; text-transform: uppercase; }
+        input, select { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; margin-bottom: 10px; box-sizing: border-box; }
+        
+        .dashboard-carga { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 15px; }
+        .dash-card { background: #fff; border: 1px solid #eee; padding: 10px; border-radius: 8px; text-align: center; }
+        .dash-card span { display: block; font-size: 18px; font-weight: bold; color: #1a73e8; }
+        .dash-card label { font-size: 9px; margin: 0; }
+
+        .btn-primary { width: 100%; padding: 12px; background: #1a73e8; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        .btn-danger { width: 100%; padding: 10px; background: #ea4335; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; margin-top: 10px; display: none; }
+        
+        .resumen-ruta { margin-top: 8px; padding: 10px; border-radius: 8px; color: white; font-size: 11px; display: flex; justify-content: space-between; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+    <div id="ui-panel">
+        <div style="padding: 15px;">
+            <h3 style="margin:0 0 15px 0; color:#1a73e8;">Control de Carga Total</h3>
+            
+            <div id="cargaReport" class="dashboard-carga" style="display:none;">
+                <div class="dash-card"><label>DENTRO DE RANGO</label><span id="countOk">0</span></div>
+                <div class="dash-card"><label>CARGA BAJA</label><span id="countLow" style="color:#ea4335">0</span></div>
+                <div class="dash-card"><label>TIENDAS ASIGNADAS</label><span id="countTiendas">0</span></div>
+                <div class="dash-card"><label>TIENDAS EN ROJO</label><span id="countRed" style="color:#666">0</span></div>
+            </div>
+
+            <div class="control-group">
+                <label>1. Configuración de Filtros</label>
+                <input type="file" id="excelInput" accept=".xlsx, .xls, .csv">
+                <div id="col-sel" style="display:none;">
+                    <select id="selectLat"></select><select id="selectLng"></select>
+                    <button class="btn-primary" style="background:#34a853" onclick="cargarPuntos()">Mapear Tiendas</button>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label>2. Rango de Tiendas</label>
+                <div style="display:flex; gap:10px;">
+                    <div style="flex:1;"><label>Mínimo:</label><input type="number" id="tiendasMin" value="5"></div>
+                    <div style="flex:1;"><label>Máximo:</label><input type="number" id="tiendasMax" value="12"></div>
+                </div>
+                <label>Empleados:</label><input type="number" id="numK" value="10">
+                <label>Radio Máx (km):</label><input type="number" id="radioMax" value="50">
+            </div>
+
+            <button class="btn-primary" onclick="ejecutarPlanificacion()">Calcular Plan Maestro</button>
+            <button id="btnLimpiar" class="btn-danger" onclick="quitarSubempleados()">🗑️ Eliminar Rutas Ineficientes</button>
+
+            <div id="stats"></div>
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <script>
+        let mapa, marcadores = [], capasZonas = [], capasRutas = [], tiendas = [];
+        const colores = ['#4285F4', '#34A853', '#FBBC05', '#8E44AD', '#FF6D00', '#00ACC1', '#E91E63', '#2C3E50', '#795548', '#607D8B'];
+
+        function initMap() {
+            mapa = new google.maps.Map(document.getElementById("map"), {
+                zoom: 5, center: { lat: 28.5, lng: -81.3 }
+            });
+            document.getElementById('excelInput').addEventListener('change', leerArchivo);
+        }
+
+        function leerArchivo(e) {
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                const data = new Uint8Array(ev.target.result);
+                const wb = XLSX.read(data, { type: 'array' });
+                const raw = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+                const cols = Object.keys(raw[0]);
+                const sl = document.getElementById('selectLat'), sg = document.getElementById('selectLng');
+                sl.innerHTML = ''; sg.innerHTML = '';
+                cols.forEach(c => { sl.add(new Option(c, c)); sg.add(new Option(c, c)); });
+                document.getElementById('col-sel').style.display = 'block';
+                window.datosExcel = raw;
+            };
+            reader.readAsArrayBuffer(e.target.files[0]);
+        }
+
+        function cargarPuntos() {
+            limpiarMapa();
+            const latK = document.getElementById('selectLat').value;
+            const lngK = document.getElementById('selectLng').value;
+            tiendas = window.datosExcel.map(f => ({ lat: parseFloat(f[latK]), lng: parseFloat(f[lngK]), cluster: -1, asignada: false }))
+                                      .filter(p => !isNaN(p.lat) && !isNaN(p.lng));
+            tiendas.forEach(p => marcadores.push(new google.maps.Marker({ position: p, map: mapa })));
+            const b = new google.maps.LatLngBounds();
+            tiendas.forEach(p => b.extend(p));
+            mapa.fitBounds(b);
+        }
+
+        function ejecutarPlanificacion() {
+            limpiarCapas();
+            const k = parseInt(document.getElementById('numK').value);
+            const tMin = parseInt(document.getElementById('tiendasMin').value);
+            const tMax = parseInt(document.getElementById('tiendasMax').value);
+            const radioM = parseInt(document.getElementById('radioMax').value) * 1000;
+
+            let centros = tiendas.slice(0, k).map(p => ({ lat: p.lat, lng: p.lng }));
+            let matriz = [];
+            tiendas.forEach((t, tIdx) => {
+                centros.forEach((c, cIdx) => {
+                    matriz.push({ tIdx, cIdx, d: google.maps.geometry.spherical.computeDistanceBetween(new google.maps.LatLng(t), new google.maps.LatLng(c)) });
+                });
+            });
+            matriz.sort((a, b) => a.d - b.d);
+
+            let carga = Array(k).fill(0);
+            matriz.forEach(p => {
+                if (!tiendas[p.tIdx].asignada && carga[p.cIdx] < tMax && p.d <= radioM) {
+                    tiendas[p.tIdx].asignada = true;
+                    tiendas[p.tIdx].cluster = p.cIdx;
+                    carga[p.cIdx]++;
+                }
+            });
+
+            renderizarResultados(k, tMin);
+        }
+
+        function renderizarResultados(k, tMin) {
+            let html = "";
+            let cOk = 0, cLow = 0, cTiendas = 0;
+
+            for (let i = 0; i < k; i++) {
+                const color = colores[i % colores.length];
+                let pts = tiendas.filter(t => t.cluster === i && t.asignada);
+                
+                if (pts.length > 0) {
+                    cTiendas += pts.length;
+                    if (pts.length >= tMin) cOk++; else cLow++;
+
+                    // DIBUJAR POLÍGONO (ZONA)
+                    if (pts.length >= 3) {
+                        const hull = calcularHull(pts);
+                        capasZonas.push(new google.maps.Polygon({ paths: hull, fillColor: color, fillOpacity: 0.2, strokeColor: color, strokeWeight: 1, map: mapa }));
+                    }
+                    
+                    // DIBUJAR RUTA
+                    const ruta = calcularTSP(pts);
+                    capasRutas.push(new google.maps.Polyline({ path: ruta, strokeColor: color, strokeOpacity: 0.8, strokeWeight: 4, map: mapa }));
+                    
+                    ruta.forEach((p, idx) => {
+                        marcadores.push(new google.maps.Marker({
+                            position: p, map: mapa,
+                            label: { text: (idx + 1).toString(), color: 'white', fontWeight: 'bold' },
+                            icon: { path: "M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7z", fillColor: color, fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2, scale: 1.5, labelOrigin: new google.maps.Point(12, 9), anchor: new google.maps.Point(12, 24) }
+                        }));
+                    });
+
+                    html += `<div class="resumen-ruta" style="background:${color}" onclick="enfocar(${i})">
+                                <span>Empleado ${i+1}</span>
+                                <span>${pts.length} paradas</span>
+                             </div>`;
+                }
+            }
+            
+            const huérfanas = tiendas.filter(t => !t.asignada).length;
+            tiendas.filter(t => !t.asignada).forEach(t => marcadores.push(new google.maps.Marker({ position: t, map: mapa })));
+
+            // ACTUALIZAR DASHBOARD
+            document.getElementById('cargaReport').style.display = 'grid';
+            document.getElementById('countOk').innerText = cOk;
+            document.getElementById('countLow').innerText = cLow;
+            document.getElementById('countTiendas').innerText = cTiendas;
+            document.getElementById('countRed').innerText = huérfanas;
+            
+            document.getElementById('stats').innerHTML = html;
+            document.getElementById('btnLimpiar').style.display = cLow > 0 ? 'block' : 'none';
+        }
+
+        function quitarSubempleados() {
+            const tMin = parseInt(document.getElementById('tiendasMin').value);
+            tiendas.forEach(t => {
+                if (t.asignada) {
+                    const conteo = tiendas.filter(x => x.cluster === t.cluster && x.asignada).length;
+                    if (conteo < tMin) { t.asignada = false; t.cluster = -1; }
+                }
+            });
+            renderizarResultados(parseInt(document.getElementById('numK').value), tMin);
+        }
+
+        function calcularHull(pts) {
+            pts.sort((a, b) => a.lat - b.lat || a.lng - b.lng);
+            const cross = (o, a, b) => (a.lat - o.lat) * (b.lng - o.lng) - (a.lng - o.lng) * (b.lat - o.lat);
+            const lower = []; for (let p of pts) { while (lower.length >= 2 && cross(lower[lower.length-2], lower[lower.length-1], p) <= 0) lower.pop(); lower.push(p); }
+            const upper = []; for (let i = pts.length-1; i>=0; i--) { let p = pts[i]; while (upper.length >= 2 && cross(upper[upper.length-2], upper[upper.length-1], p) <= 0) upper.pop(); upper.pop(); upper.push(p); }
+            lower.pop(); upper.pop(); return lower.concat(upper);
+        }
+
+        function calcularTSP(pts) {
+            let r = [], d = [...pts], a = d.shift(); r.push(a);
+            while (d.length > 0) {
+                let idx = -1, dist = Infinity;
+                for (let i=0; i<d.length; i++) {
+                    const m = google.maps.geometry.spherical.computeDistanceBetween(new google.maps.LatLng(a), new google.maps.LatLng(d[i]));
+                    if (m < dist) { dist = m; idx = i; }
+                }
+                a = d.splice(idx, 1)[0]; r.push(a);
+            }
+            return r;
+        }
+
+        function enfocar(id) {
+            const pts = tiendas.filter(t => t.cluster === id && t.asignada);
+            if (pts.length > 0) {
+                const b = new google.maps.LatLngBounds();
+                pts.forEach(p => b.extend(p));
+                mapa.fitBounds(b);
+            }
+        }
+
+        function limpiarCapas() {
+            capasZonas.forEach(z => z.setMap(null)); capasZonas = [];
+            capasRutas.forEach(r => r.setMap(null)); capasRutas = [];
+            marcadores.forEach(m => m.setMap(null)); marcadores = [];
+            tiendas.forEach(t => t.asignada = false);
+        }
+
+        function limpiarMapa() {
+            marcadores.forEach(m => m.setMap(null)); marcadores = [];
+            capasZonas.forEach(z => z.setMap(null)); capasZonas = [];
+            capasRutas.forEach(r => r.setMap(null)); capasRutas = [];
+        }
+    </script>
+    <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBJa1qV7hKPdLBKG4aApNY8CQFpTk9o0aM&libraries=geometry&callback=initMap" async defer></script>
+</body>
+</html>
